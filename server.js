@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import twilio from 'twilio';
 import crypto from 'crypto';
+import bcrypt from 'bcrypt';
 
 // Load environment variables
 dotenv.config();
@@ -73,6 +74,9 @@ const OTP_EXPIRY_MINUTES = 10; // OTP expires in 10 minutes
 const MAX_OTP_ATTEMPTS = 5; // Maximum verification attempts
 const OTP_LENGTH = 6;
 
+// Password hashing configuration
+const BCRYPT_SALT_ROUNDS = 10;
+
 // Helper function to generate OTP
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -90,6 +94,16 @@ function formatPhoneNumber(phone) {
   }
   
   return cleaned;
+}
+
+// Helper function to hash passwords
+async function hashPassword(password) {
+  return await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+}
+
+// Helper function to verify passwords (for login authentication)
+async function verifyPassword(plainPassword, hashedPassword) {
+  return await bcrypt.compare(plainPassword, hashedPassword);
 }
 
 // Health check endpoint
@@ -219,6 +233,9 @@ app.post('/api/signup', async (req, res) => {
       });
     }
 
+    // Hash the MT5 password before storing
+    const hashedMT5Password = await bcrypt.hash(mt5Password, BCRYPT_SALT_ROUNDS);
+
     // Insert MT5 login data
     const { data: mt5Data, error: mt5Error } = await supabase
       .from('mt5_logins')
@@ -226,7 +243,7 @@ app.post('/api/signup', async (req, res) => {
         {
           user_id: userData.id,
           login: mt5Login,
-          password: mt5Password, // Note: In production, this should be encrypted
+          password: hashedMT5Password, // Password is now hashed with bcrypt
           server: mt5Server,
           is_active: true,
           is_primary: true, // First MT5 login is primary
@@ -653,6 +670,78 @@ app.post('/api/verify-otp', async (req, res) => {
 });
 
 // ============================================
+// AUTHENTICATION ENDPOINTS
+// ============================================
+
+// Login endpoint (example - for when you add user authentication)
+// Note: This is a template for future implementation
+app.post('/api/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email and password are required'
+      });
+    }
+
+    // Example: Fetch user by email (you'll need to add a password column to users table)
+    // const { data: user, error } = await supabase
+    //   .from('users')
+    //   .select('id, email, password, full_name, status')
+    //   .eq('email', email)
+    //   .single();
+
+    // if (error || !user) {
+    //   return res.status(401).json({
+    //     success: false,
+    //     error: 'Invalid email or password'
+    //   });
+    // }
+
+    // // Verify password using bcrypt
+    // const isPasswordValid = await verifyPassword(password, user.password);
+
+    // if (!isPasswordValid) {
+    //   return res.status(401).json({
+    //     success: false,
+    //     error: 'Invalid email or password'
+    //   });
+    // }
+
+    // // Check if user is active
+    // if (user.status !== 'active') {
+    //   return res.status(403).json({
+    //     success: false,
+    //     error: 'Account is not active. Please contact support.'
+    //   });
+    // }
+
+    // // Return user data (excluding password)
+    // const { password: _, ...userData } = user;
+    
+    // res.json({
+    //   success: true,
+    //   message: 'Login successful',
+    //   data: userData
+    // });
+
+    return res.status(501).json({
+      success: false,
+      error: 'Login endpoint not yet implemented. Add password field to users table first.'
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// ============================================
 // PARTNER MANAGEMENT ENDPOINTS
 // ============================================
 
@@ -794,6 +883,240 @@ app.get('/api/partners/:id/statistics', async (req, res) => {
   }
 });
 
+// Update partner (admin)
+app.put('/api/admin/partners/:partnerId', async (req, res) => {
+  try {
+    const { partnerId } = req.params;
+    const { name, email, phone, companyName, commissionRate, notes, status } = req.body;
+
+    // Check if partner exists
+    const { data: existingPartner, error: checkError } = await supabase
+      .from('partners')
+      .select('id, email')
+      .eq('id', partnerId)
+      .single();
+
+    if (checkError || !existingPartner) {
+      return res.status(404).json({
+        success: false,
+        error: 'Partner not found'
+      });
+    }
+
+    // If email is being changed, check if new email already exists
+    if (email && email !== existingPartner.email) {
+      const { data: emailExists } = await supabase
+        .from('partners')
+        .select('id')
+        .eq('email', email)
+        .neq('id', partnerId)
+        .single();
+
+      if (emailExists) {
+        return res.status(409).json({
+          success: false,
+          error: 'Email already exists for another partner'
+        });
+      }
+    }
+
+    // Build update object
+    const updateData = {
+      updated_at: new Date().toISOString()
+    };
+
+    if (name !== undefined) updateData.name = name;
+    if (email !== undefined) updateData.email = email;
+    if (phone !== undefined) updateData.phone = phone;
+    if (companyName !== undefined) updateData.company_name = companyName;
+    if (commissionRate !== undefined) updateData.commission_rate = parseFloat(commissionRate);
+    if (notes !== undefined) updateData.notes = notes;
+    if (status !== undefined) updateData.status = status;
+
+    // Update partner
+    const { data: updatedPartner, error: updateError } = await supabase
+      .from('partners')
+      .update(updateData)
+      .eq('id', partnerId)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Error updating partner:', updateError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to update partner',
+        details: updateError.message
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Partner updated successfully',
+      data: updatedPartner
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// Delete partner (admin)
+app.delete('/api/admin/partners/:partnerId', async (req, res) => {
+  try {
+    const { partnerId } = req.params;
+    const { cascade } = req.query;
+
+    // Check if partner exists
+    const { data: existingPartner, error: checkError } = await supabase
+      .from('partners')
+      .select('id, name, email')
+      .eq('id', partnerId)
+      .single();
+
+    if (checkError || !existingPartner) {
+      return res.status(404).json({
+        success: false,
+        error: 'Partner not found'
+      });
+    }
+
+    // Check if partner has associated users
+    const { data: associatedUsers } = await supabase
+      .from('users')
+      .select('id')
+      .eq('partner_id', partnerId);
+
+    if (associatedUsers && associatedUsers.length > 0) {
+      if (cascade === 'true') {
+        // Set partner_id to null for all associated users
+        await supabase
+          .from('users')
+          .update({ partner_id: null })
+          .eq('partner_id', partnerId);
+      } else {
+        return res.status(400).json({
+          success: false,
+          error: 'Cannot delete partner with associated users. Use cascade=true to unlink users.',
+          relatedData: {
+            users: associatedUsers.length
+          }
+        });
+      }
+    }
+
+    // Delete the partner
+    const { error: deleteError } = await supabase
+      .from('partners')
+      .delete()
+      .eq('id', partnerId);
+
+    if (deleteError) {
+      console.error('Error deleting partner:', deleteError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to delete partner',
+        details: deleteError.message
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Partner ${existingPartner.name} (${existingPartner.email}) deleted successfully`,
+      deletedPartner: {
+        id: existingPartner.id,
+        name: existingPartner.name,
+        email: existingPartner.email
+      }
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// Update partner status (admin)
+app.patch('/api/admin/partners/:partnerId/status', async (req, res) => {
+  try {
+    const { partnerId } = req.params;
+    const { status } = req.body;
+
+    if (!status) {
+      return res.status(400).json({
+        success: false,
+        error: 'Status is required'
+      });
+    }
+
+    // Validate status
+    const validStatuses = ['active', 'inactive', 'suspended'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
+      });
+    }
+
+    // Check if partner exists
+    const { data: existingPartner, error: checkError } = await supabase
+      .from('partners')
+      .select('id, name, email, status')
+      .eq('id', partnerId)
+      .single();
+
+    if (checkError || !existingPartner) {
+      return res.status(404).json({
+        success: false,
+        error: 'Partner not found'
+      });
+    }
+
+    // Update status
+    const { data: updatedPartner, error: updateError } = await supabase
+      .from('partners')
+      .update({
+        status,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', partnerId)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Error updating partner status:', updateError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to update partner status',
+        details: updateError.message
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Partner status changed from ${existingPartner.status} to ${status}`,
+      data: updatedPartner
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
 // ============================================
 // MT5 LOGIN MANAGEMENT ENDPOINTS
 // ============================================
@@ -883,13 +1206,16 @@ app.post('/api/users/:userId/mt5-logins', async (req, res) => {
         .eq('is_primary', true);
     }
 
+    // Hash the MT5 password before storing
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+
     const { data, error } = await supabase
       .from('mt5_logins')
       .insert([
         {
           user_id: userId,
           login,
-          password, // Note: In production, this should be encrypted
+          password: hashedPassword, // Password is now hashed with bcrypt
           server,
           is_active: true,
           is_primary: isPrimary || false
@@ -970,6 +1296,183 @@ app.get('/api/users/:userId', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Internal server error'
+    });
+  }
+});
+
+// Update MT5 login (admin)
+app.put('/api/admin/mt5-logins/:mt5LoginId', async (req, res) => {
+  try {
+    const { mt5LoginId } = req.params;
+    const { login, password, server, isActive, isPrimary } = req.body;
+
+    // Check if MT5 login exists
+    const { data: existingMT5, error: checkError } = await supabase
+      .from('mt5_logins')
+      .select('id, user_id, login, server')
+      .eq('id', mt5LoginId)
+      .single();
+
+    if (checkError || !existingMT5) {
+      return res.status(404).json({
+        success: false,
+        error: 'MT5 login not found'
+      });
+    }
+
+    // If login or server is being changed, check for duplicates
+    if ((login && login !== existingMT5.login) || (server && server !== existingMT5.server)) {
+      const checkLogin = login || existingMT5.login;
+      const checkServer = server || existingMT5.server;
+
+      const { data: duplicate } = await supabase
+        .from('mt5_logins')
+        .select('id')
+        .eq('login', checkLogin)
+        .eq('server', checkServer)
+        .neq('id', mt5LoginId)
+        .single();
+
+      if (duplicate) {
+        return res.status(409).json({
+          success: false,
+          error: 'MT5 login already exists for this server'
+        });
+      }
+    }
+
+    // If setting as primary, unset other primary logins for this user
+    if (isPrimary === true) {
+      await supabase
+        .from('mt5_logins')
+        .update({ is_primary: false })
+        .eq('user_id', existingMT5.user_id)
+        .eq('is_primary', true)
+        .neq('id', mt5LoginId);
+    }
+
+    // Build update object
+    const updateData = {
+      updated_at: new Date().toISOString()
+    };
+
+    if (login !== undefined) updateData.login = login;
+    if (server !== undefined) updateData.server = server;
+    if (isActive !== undefined) updateData.is_active = isActive;
+    if (isPrimary !== undefined) updateData.is_primary = isPrimary;
+
+    // Hash password if provided
+    if (password !== undefined) {
+      updateData.password = await hashPassword(password);
+    }
+
+    // Update MT5 login
+    const { data: updatedMT5, error: updateError } = await supabase
+      .from('mt5_logins')
+      .update(updateData)
+      .eq('id', mt5LoginId)
+      .select('id, user_id, login, server, is_active, is_primary, created_at, updated_at')
+      .single();
+
+    if (updateError) {
+      console.error('Error updating MT5 login:', updateError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to update MT5 login',
+        details: updateError.message
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'MT5 login updated successfully',
+      data: updatedMT5
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// Delete MT5 login (admin)
+app.delete('/api/admin/mt5-logins/:mt5LoginId', async (req, res) => {
+  try {
+    const { mt5LoginId } = req.params;
+
+    // Check if MT5 login exists
+    const { data: existingMT5, error: checkError } = await supabase
+      .from('mt5_logins')
+      .select('id, user_id, login, server, is_primary')
+      .eq('id', mt5LoginId)
+      .single();
+
+    if (checkError || !existingMT5) {
+      return res.status(404).json({
+        success: false,
+        error: 'MT5 login not found'
+      });
+    }
+
+    // Check if this is the only MT5 login for the user
+    const { data: userMT5Logins } = await supabase
+      .from('mt5_logins')
+      .select('id')
+      .eq('user_id', existingMT5.user_id);
+
+    if (userMT5Logins && userMT5Logins.length === 1) {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot delete the only MT5 login for a user. Delete the user instead or add another MT5 login first.'
+      });
+    }
+
+    // If this is a primary login, set another one as primary
+    if (existingMT5.is_primary && userMT5Logins && userMT5Logins.length > 1) {
+      const otherMT5 = userMT5Logins.find(mt5 => mt5.id !== mt5LoginId);
+      if (otherMT5) {
+        await supabase
+          .from('mt5_logins')
+          .update({ is_primary: true })
+          .eq('id', otherMT5.id);
+      }
+    }
+
+    // Delete the MT5 login
+    const { error: deleteError } = await supabase
+      .from('mt5_logins')
+      .delete()
+      .eq('id', mt5LoginId);
+
+    if (deleteError) {
+      console.error('Error deleting MT5 login:', deleteError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to delete MT5 login',
+        details: deleteError.message
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `MT5 login ${existingMT5.login} deleted successfully`,
+      deletedMT5: {
+        id: existingMT5.id,
+        login: existingMT5.login,
+        server: existingMT5.server
+      }
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
     });
   }
 });
@@ -1235,6 +1738,297 @@ app.get('/api/admin/dashboard/stats', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Internal server error'
+    });
+  }
+});
+
+// Update user details (admin)
+app.put('/api/admin/users/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const {
+      fullName,
+      email,
+      phone,
+      investmentAmount,
+      profitSharing,
+      country,
+      status,
+      partnerId
+    } = req.body;
+
+    // Check if user exists
+    const { data: existingUser, error: checkError } = await supabase
+      .from('users')
+      .select('id, email')
+      .eq('id', userId)
+      .single();
+
+    if (checkError || !existingUser) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    // If email is being changed, check if new email already exists
+    if (email && email !== existingUser.email) {
+      const { data: emailExists } = await supabase
+        .from('users')
+        .select('id')
+        .eq('email', email)
+        .neq('id', userId)
+        .single();
+
+      if (emailExists) {
+        return res.status(409).json({
+          success: false,
+          error: 'Email already exists for another user'
+        });
+      }
+    }
+
+    // Validate partner if provided
+    if (partnerId !== undefined && partnerId !== null) {
+      const { data: partner, error: partnerError } = await supabase
+        .from('partners')
+        .select('id, status')
+        .eq('id', partnerId)
+        .single();
+
+      if (partnerError || !partner) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid partner ID'
+        });
+      }
+
+      if (partner.status !== 'active') {
+        return res.status(400).json({
+          success: false,
+          error: 'Partner is not active'
+        });
+      }
+    }
+
+    // Build update object (only include provided fields)
+    const updateData = {
+      updated_at: new Date().toISOString()
+    };
+
+    if (fullName !== undefined) updateData.full_name = fullName;
+    if (email !== undefined) updateData.email = email;
+    if (phone !== undefined) updateData.phone = phone;
+    if (investmentAmount !== undefined) updateData.investment_amount = parseFloat(investmentAmount);
+    if (profitSharing !== undefined) updateData.profit_sharing = profitSharing ? parseFloat(profitSharing) : null;
+    if (country !== undefined) updateData.country = country;
+    if (status !== undefined) updateData.status = status;
+    if (partnerId !== undefined) updateData.partner_id = partnerId;
+
+    // Update user
+    const { data: updatedUser, error: updateError } = await supabase
+      .from('users')
+      .update(updateData)
+      .eq('id', userId)
+      .select(`
+        *,
+        partners (
+          id,
+          name,
+          email,
+          company_name
+        )
+      `)
+      .single();
+
+    if (updateError) {
+      console.error('Error updating user:', updateError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to update user',
+        details: updateError.message
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'User updated successfully',
+      data: updatedUser
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// Delete user (admin)
+app.delete('/api/admin/users/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { cascade } = req.query; // Option to cascade delete related data
+
+    // Check if user exists
+    const { data: existingUser, error: checkError } = await supabase
+      .from('users')
+      .select('id, full_name, email')
+      .eq('id', userId)
+      .single();
+
+    if (checkError || !existingUser) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    // If cascade is true, delete related MT5 logins first
+    if (cascade === 'true') {
+      // Delete MT5 logins
+      const { error: mt5DeleteError } = await supabase
+        .from('mt5_logins')
+        .delete()
+        .eq('user_id', userId);
+
+      if (mt5DeleteError) {
+        console.error('Error deleting MT5 logins:', mt5DeleteError);
+        return res.status(500).json({
+          success: false,
+          error: 'Failed to delete user MT5 logins',
+          details: mt5DeleteError.message
+        });
+      }
+
+      // Update invites if any exist
+      await supabase
+        .from('invites')
+        .update({ used_by_user_id: null })
+        .eq('used_by_user_id', userId);
+    } else {
+      // Check if user has MT5 logins
+      const { data: mt5Logins } = await supabase
+        .from('mt5_logins')
+        .select('id')
+        .eq('user_id', userId);
+
+      if (mt5Logins && mt5Logins.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Cannot delete user with existing MT5 logins. Use cascade=true to delete all related data.',
+          relatedData: {
+            mt5Logins: mt5Logins.length
+          }
+        });
+      }
+    }
+
+    // Delete the user
+    const { error: deleteError } = await supabase
+      .from('users')
+      .delete()
+      .eq('id', userId);
+
+    if (deleteError) {
+      console.error('Error deleting user:', deleteError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to delete user',
+        details: deleteError.message
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `User ${existingUser.full_name} (${existingUser.email}) deleted successfully`,
+      deletedUser: {
+        id: existingUser.id,
+        fullName: existingUser.full_name,
+        email: existingUser.email
+      }
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// Update user status (admin - quick status change)
+app.patch('/api/admin/users/:userId/status', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { status } = req.body;
+
+    if (!status) {
+      return res.status(400).json({
+        success: false,
+        error: 'Status is required'
+      });
+    }
+
+    // Validate status
+    const validStatuses = ['pending', 'active', 'suspended', 'rejected'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
+      });
+    }
+
+    // Check if user exists
+    const { data: existingUser, error: checkError } = await supabase
+      .from('users')
+      .select('id, full_name, email, status')
+      .eq('id', userId)
+      .single();
+
+    if (checkError || !existingUser) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    // Update status
+    const { data: updatedUser, error: updateError } = await supabase
+      .from('users')
+      .update({
+        status,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userId)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('Error updating user status:', updateError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to update user status',
+        details: updateError.message
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `User status changed from ${existingUser.status} to ${status}`,
+      data: updatedUser
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
     });
   }
 });
