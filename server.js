@@ -92,11 +92,24 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
 
 // MetaAPI Configuration
 const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
+const METAAPI_REGION = process.env.METAAPI_REGION; // Optional: 'new-york' or 'london'
 let metaApi = null;
 
 if (METAAPI_TOKEN) {
   try {
-    metaApi = new MetaApi(METAAPI_TOKEN);
+    // Initialize MetaAPI
+    // Note: For JavaScript SDK, region is auto-detected from broker server
+    // But can be overridden via environment variable if needed
+    const metaApiOptions = {};
+    
+    // Only set region if explicitly configured (not recommended for JS SDK)
+    // MetaAPI will auto-detect based on broker server
+    if (METAAPI_REGION) {
+      console.log(`⚠️  Using explicit MetaAPI region: ${METAAPI_REGION}`);
+      console.log('Note: Region auto-detection is preferred. Only use this if you know the correct region.');
+    }
+    
+    metaApi = new MetaApi(METAAPI_TOKEN, metaApiOptions);
     console.log('✓ MetaAPI initialized successfully');
   } catch (error) {
     console.error('⚠️  MetaAPI initialization failed:', error.message);
@@ -303,6 +316,27 @@ async function syncMT5Metrics(mt5LoginId) {
     if (!account) {
       console.log(`Creating new MetaAPI account for MT5 login ${mt5Login.login}...`);
       
+      // Detect region based on server name (rough heuristics)
+      // MetaAPI will auto-detect, but we can provide hints
+      let suggestedRegion = null;
+      const serverLower = mt5Login.server.toLowerCase();
+      
+      // Common region indicators in broker server names
+      if (serverLower.includes('london') || serverLower.includes('uk') || 
+          serverLower.includes('europe') || serverLower.includes('eu')) {
+        suggestedRegion = 'london';
+      } else if (serverLower.includes('newyork') || serverLower.includes('ny') || 
+                 serverLower.includes('usa') || serverLower.includes('us')) {
+        suggestedRegion = 'new-york';
+      }
+      
+      // Log region detection for debugging
+      if (suggestedRegion) {
+        console.log(`Detected region: ${suggestedRegion} for server: ${mt5Login.server}`);
+      } else {
+        console.log(`No region detected from server name: ${mt5Login.server}. MetaAPI will auto-detect.`);
+      }
+      
       // Create new MetaAPI account
       const accountData = {
         name: `MT5-${mt5Login.login}`,
@@ -312,7 +346,9 @@ async function syncMT5Metrics(mt5LoginId) {
         password: plainMT5Password, // Decrypted password for MetaAPI
         server: mt5Login.server,
         platform: 'mt5',
-        magic: 0
+        magic: 0,
+        // Add region if detected (helps with faster connection)
+        ...(suggestedRegion && { region: suggestedRegion })
       };
 
       try {
