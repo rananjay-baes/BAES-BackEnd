@@ -652,7 +652,8 @@ app.post('/api/signup', async (req, res) => {
       mt5Accounts, // Array of MT5 accounts
       emailVerified,
       phoneVerified,
-      partnerId // Optional: partner ID if user was referred by a partner
+      partnerId, // Optional: partner ID if user was referred by a partner
+      inviteToken // Required: invitation token from signup URL
     } = req.body;
 
     // Validation
@@ -660,6 +661,52 @@ app.post('/api/signup', async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'Missing required fields'
+      });
+    }
+
+    // Validate invitation token (REQUIRED)
+    if (!inviteToken) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invitation token is required. Please use your unique invitation link.'
+      });
+    }
+
+    // Check if invitation exists and is valid
+    const { data: invitation, error: inviteError } = await supabase
+      .from('invites')
+      .select('id, email, token, status, investment_amount, profit_sharing')
+      .eq('token', inviteToken)
+      .single();
+
+    if (inviteError || !invitation) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invalid or expired invitation. Please contact support.'
+      });
+    }
+
+    // Check if invitation is already used
+    if (invitation.status === 'used') {
+      return res.status(400).json({
+        success: false,
+        error: 'This invitation has already been used.'
+      });
+    }
+
+    // Check if invitation status is not pending
+    if (invitation.status !== 'pending') {
+      return res.status(400).json({
+        success: false,
+        error: 'This invitation is not valid. Status: ' + invitation.status
+      });
+    }
+
+    // Validate email matches invitation
+    if (invitation.email.toLowerCase() !== email.toLowerCase()) {
+      return res.status(400).json({
+        success: false,
+        error: `This invitation is for ${invitation.email}. Please use the correct email address.`
       });
     }
 
@@ -814,6 +861,21 @@ app.post('/api/signup', async (req, res) => {
         error: 'Failed to create MT5 logins',
         details: mt5Error.message
       });
+    }
+
+    // Mark invitation as used
+    const { error: inviteUpdateError } = await supabase
+      .from('invites')
+      .update({
+        status: 'used',
+        used_at: new Date().toISOString(),
+        used_by_user_id: userData.id
+      })
+      .eq('token', inviteToken);
+
+    if (inviteUpdateError) {
+      console.error('Error updating invitation status:', inviteUpdateError);
+      // Don't fail signup if invitation update fails, just log it
     }
 
     // Trigger metrics sync for all MT5 accounts in background (don't wait for it)
@@ -2589,10 +2651,15 @@ app.delete('/api/admin/users/:userId', authenticateToken, requireRole('admin', '
         });
       }
 
-      // Update invites if any exist
+      // Delete invites associated with this user (by email and by used_by_user_id)
       await supabase
         .from('invites')
-        .update({ used_by_user_id: null })
+        .delete()
+        .eq('email', existingUser.email);
+      
+      await supabase
+        .from('invites')
+        .delete()
         .eq('used_by_user_id', userId);
     } else {
       // Check if user has MT5 logins
@@ -3007,6 +3074,86 @@ app.get('/api/admin/invites', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Internal server error'
+    });
+  }
+});
+
+// Delete invite (admin)
+app.delete('/api/admin/invites/:inviteId', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { inviteId } = req.params;
+
+    // Check if invite exists
+    const { data: existingInvite, error: checkError } = await supabase
+      .from('invites')
+      .select('id, email, status, token')
+      .eq('id', inviteId)
+      .single();
+
+    if (checkError || !existingInvite) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invite not found'
+      });
+    }
+
+    // Check if invite is already used
+    if (existingInvite.status === 'used') {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot delete an invite that has already been used. Delete the user instead.',
+        invite: {
+          id: existingInvite.id,
+          email: existingInvite.email,
+          status: existingInvite.status
+        }
+      });
+    }
+
+    // Delete the invite
+    const { error: deleteError } = await supabase
+      .from('invites')
+      .delete()
+      .eq('id', inviteId);
+
+    if (deleteError) {
+      console.error('Error deleting invite:', deleteError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to delete invite',
+        details: deleteError.message
+      });
+    }
+
+    // Log the action
+    if (req.admin) {
+      await logAdminAction(
+        req.admin.id,
+        req.admin.email,
+        'invite_delete',
+        'invite',
+        inviteId,
+        { email: existingInvite.email, status: existingInvite.status },
+        req
+      );
+    }
+
+    res.json({
+      success: true,
+      message: `Invite for ${existingInvite.email} deleted successfully`,
+      deletedInvite: {
+        id: existingInvite.id,
+        email: existingInvite.email,
+        status: existingInvite.status
+      }
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
     });
   }
 });
