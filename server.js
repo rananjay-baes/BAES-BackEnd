@@ -277,138 +277,22 @@ async function syncMT5Metrics(mt5LoginId) {
       throw new Error('MT5 login not found');
     }
 
+    // Check if MetaAPI account exists (should have been created during signup)
+    if (!mt5Login.metaapi_account_id) {
+      throw new Error('MetaAPI account not found. Account should have been created during signup.');
+    }
+
     // Update status to syncing
     await supabase
       .from('mt5_logins')
       .update({ sync_status: 'syncing' })
       .eq('id', mt5LoginId);
 
-    let account;
-    let accountInfo;
+    // Get the MetaAPI account
+    const account = await metaApi.metatraderAccountApi.getAccount(mt5Login.metaapi_account_id);
+    console.log(`Using MetaAPI account ${account.id} for MT5 login ${mt5Login.login}`);
 
-    // If we already have a MetaAPI account ID, use it
-    if (mt5Login.metaapi_account_id) {
-      try {
-        account = await metaApi.metatraderAccountApi.getAccount(mt5Login.metaapi_account_id);
-      } catch (error) {
-        // Account not found or invalid, we'll create a new one
-        console.log('Existing MetaAPI account not found, creating new one');
-      }
-    }
-
-    // Decrypt MT5 password for MetaAPI connection
-    const plainMT5Password = decryptMT5Password(mt5Login.password);
-
-    // Create or update MetaAPI account
-    if (!account) {
-      console.log(`Creating new MetaAPI account for MT5 login ${mt5Login.login}...`);
-      
-      // Create new MetaAPI account
-      const accountData = {
-        name: `MT5-${mt5Login.login}`,
-        type: 'cloud',
-        login: mt5Login.login,
-        // Note: Password should be investor (read-only) password for security
-        password: plainMT5Password, // Decrypted password for MetaAPI
-        server: mt5Login.server,
-        platform: 'mt5',
-        magic: 0
-      };
-
-      try {
-        account = await metaApi.metatraderAccountApi.createAccount(accountData);
-        console.log(`MetaAPI account created with ID: ${account.id}`);
-      } catch (createError) {
-        throw new Error(`Failed to create MetaAPI account: ${createError.message}. Please verify MT5 server name is correct.`);
-      }
-      
-      // Store MetaAPI account ID
-      await supabase
-        .from('mt5_logins')
-        .update({ metaapi_account_id: account.id })
-        .eq('id', mt5LoginId);
-
-      // Wait for account to deploy (with timeout)
-      console.log(`Deploying MetaAPI account ${account.id}...`);
-      try {
-        await account.deploy();
-        await account.waitDeployed({ timeoutInSeconds: 300 }); // 5 minute timeout
-        console.log(`MetaAPI account ${account.id} deployed successfully`);
-      } catch (deployError) {
-        throw new Error(`Account deployment failed: ${deployError.message}. This may be due to invalid credentials or broker server issues.`);
-      }
-
-      // Enable MetaStats API
-      console.log(`Enabling MetaStats API for account ${account.id}...`);
-      try {
-        const axios = (await import('axios')).default;
-        await axios.post(
-          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}/enable-metastats-api`,
-          {},
-          {
-            headers: {
-              'auth-token': METAAPI_TOKEN
-            }
-          }
-        );
-        console.log(`MetaStats API enabled for account ${account.id}`);
-      } catch (enableError) {
-        console.warn(`Warning: Failed to enable MetaStats: ${enableError.response?.data?.message || enableError.message}`);
-        // Don't throw, account is already deployed
-      }
-    } else {
-      console.log(`Using existing MetaAPI account ${account.id} for MT5 login ${mt5Login.login}`);
-      
-      // Check actual account state via API
-      const axios = (await import('axios')).default;
-      let currentState;
-      try {
-        const stateResponse = await axios.get(
-          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}`,
-          {
-            headers: {
-              'auth-token': METAAPI_TOKEN
-            }
-          }
-        );
-        currentState = stateResponse.data;
-        console.log(`Current account state: ${currentState.state}, Connection: ${currentState.connectionStatus}`);
-      } catch (stateError) {
-        console.warn(`Could not fetch account state: ${stateError.message}`);
-      }
-
-      // Only deploy if not already deployed or deploying
-      if (currentState?.state !== 'DEPLOYED' && currentState?.state !== 'DEPLOYING') {
-        console.log(`Deploying existing MetaAPI account ${account.id}...`);
-        await account.deploy();
-        await account.waitDeployed({ timeoutInSeconds: 300 });
-        console.log(`Account ${account.id} deployed successfully`);
-      } else if (currentState?.state === 'DEPLOYING') {
-        console.log(`Account ${account.id} is already deploying, will wait for connection in metrics sync`);
-      } else {
-        console.log(`Account ${account.id} is already deployed`);
-      }
-
-      // Ensure MetaStats API is enabled
-      console.log(`Ensuring MetaStats API is enabled for account ${account.id}...`);
-      try {
-        await axios.post(
-          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}/enable-metastats-api`,
-          {},
-          {
-            headers: {
-              'auth-token': METAAPI_TOKEN
-            }
-          }
-        );
-        console.log(`MetaStats API enabled for account ${account.id}`);
-      } catch (enableError) {
-        // Ignore errors if already enabled
-        console.warn(`Note: MetaStats enable returned: ${enableError.response?.status || enableError.message}`);
-      }
-    }
-
-    // Use MetaAPI HTTP endpoints instead of streaming (more reliable)
+    // Use MetaAPI HTTP endpoints to fetch metrics
     console.log(`Fetching metrics for account ${account.id} via MetaStats API...`);
     
     // Import axios for HTTP requests
@@ -977,6 +861,122 @@ app.post('/api/signup', async (req, res) => {
       }
     }
 
+    // VALIDATE MT5 CREDENTIALS by creating and deploying MetaAPI accounts
+    console.log(`Validating ${mt5Accounts.length} MT5 account(s)...`);
+    const metaApiAccounts = [];
+    
+    if (metaApi) {
+      for (let i = 0; i < mt5Accounts.length; i++) {
+        const account = mt5Accounts[i];
+        console.log(`Creating MetaAPI account for MT5 login ${account.mt5Login}...`);
+        
+        try {
+          // Create MetaAPI account
+          const metaApiAccount = await metaApi.metatraderAccountApi.createAccount({
+            name: `MT5-${account.mt5Login}`,
+            type: 'cloud',
+            login: account.mt5Login,
+            password: account.mt5Password, // Plain password for validation
+            server: account.mt5Server,
+            platform: 'mt5',
+            magic: 0
+          });
+          
+          console.log(`MetaAPI account created: ${metaApiAccount.id}`);
+          
+          // Deploy the account
+          console.log(`Deploying MetaAPI account ${metaApiAccount.id}...`);
+          await metaApiAccount.deploy();
+          await metaApiAccount.waitDeployed({ timeoutInSeconds: 300 });
+          console.log(`Account ${metaApiAccount.id} deployed successfully`);
+          
+          // Enable MetaStats API
+          try {
+            const axios = (await import('axios')).default;
+            await axios.post(
+              `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccount.id}/enable-metastats-api`,
+              {},
+              {
+                headers: {
+                  'auth-token': METAAPI_TOKEN
+                }
+              }
+            );
+            console.log(`MetaStats enabled for account ${metaApiAccount.id}`);
+          } catch (enableError) {
+            console.warn(`MetaStats enable warning: ${enableError.message}`);
+          }
+          
+          // Verify connection by checking state
+          try {
+            const axios = (await import('axios')).default;
+            const stateResponse = await axios.get(
+              `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccount.id}`,
+              {
+                headers: {
+                  'auth-token': METAAPI_TOKEN
+                }
+              }
+            );
+            const accountState = stateResponse.data;
+            console.log(`Account ${metaApiAccount.id} state: ${accountState.state}, connection: ${accountState.connectionStatus}`);
+            
+            // Wait for connection (up to 60 seconds)
+            let connected = accountState.connectionStatus === 'CONNECTED';
+            let attempts = 0;
+            while (!connected && attempts < 6) {
+              await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds
+              const checkResponse = await axios.get(
+                `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccount.id}`,
+                {
+                  headers: {
+                    'auth-token': METAAPI_TOKEN
+                  }
+                }
+              );
+              connected = checkResponse.data.connectionStatus === 'CONNECTED';
+              attempts++;
+              console.log(`Connection attempt ${attempts}/6: ${checkResponse.data.connectionStatus}`);
+            }
+            
+            if (!connected) {
+              throw new Error(`MT5 account ${account.mt5Login} failed to connect to broker. Please verify credentials (login, password, server) are correct.`);
+            }
+          } catch (stateError) {
+            throw new Error(`Failed to verify MT5 account ${account.mt5Login}: ${stateError.message}`);
+          }
+          
+          metaApiAccounts.push({
+            index: i,
+            accountId: metaApiAccount.id
+          });
+          
+        } catch (createError) {
+          console.error(`Failed to create/deploy MT5 account ${account.mt5Login}:`, createError);
+          
+          // Clean up any created accounts
+          for (const created of metaApiAccounts) {
+            try {
+              const acc = await metaApi.metatraderAccountApi.getAccount(created.accountId);
+              await acc.remove();
+              console.log(`Cleaned up account ${created.accountId}`);
+            } catch (cleanupError) {
+              console.warn(`Failed to cleanup account ${created.accountId}`);
+            }
+          }
+          
+          return res.status(400).json({
+            success: false,
+            error: `Invalid MT5 credentials for login ${account.mt5Login}: ${createError.message}. Please verify your MT5 login, password, and server are correct.`
+          });
+        }
+      }
+      
+      console.log(`✓ All ${mt5Accounts.length} MT5 account(s) validated successfully`);
+    } else {
+      console.warn('⚠️  MetaAPI not initialized - skipping credential validation');
+    }
+
     // Insert user data into Supabase (without MT5 fields)
     const { data: userData, error: userError } = await supabase
       .from('users')
@@ -1007,10 +1007,13 @@ app.post('/api/signup', async (req, res) => {
       });
     }
 
-    // Insert all MT5 login accounts
+    // Insert all MT5 login accounts with MetaAPI account IDs
     const mt5InsertPromises = mt5Accounts.map(async (account, index) => {
       // Encrypt the MT5 password (not hash, so MetaAPI can decrypt and use it)
       const encryptedMT5Password = encryptMT5Password(account.mt5Password);
+      
+      // Find the corresponding MetaAPI account ID
+      const metaApiAccount = metaApiAccounts.find(acc => acc.index === index);
 
       return {
         user_id: userData.id,
@@ -1019,6 +1022,7 @@ app.post('/api/signup', async (req, res) => {
         server: account.mt5Server,
         is_active: true,
         is_primary: index === 0, // First MT5 login is primary
+        metaapi_account_id: metaApiAccount ? metaApiAccount.accountId : null,
         created_at: new Date().toISOString()
       };
     });
