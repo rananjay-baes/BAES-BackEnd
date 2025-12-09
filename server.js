@@ -301,6 +301,8 @@ async function syncMT5Metrics(mt5LoginId) {
 
     // Create or update MetaAPI account
     if (!account) {
+      console.log(`Creating new MetaAPI account for MT5 login ${mt5Login.login}...`);
+      
       // Create new MetaAPI account
       const accountData = {
         name: `MT5-${mt5Login.login}`,
@@ -313,7 +315,12 @@ async function syncMT5Metrics(mt5LoginId) {
         magic: 0
       };
 
-      account = await metaApi.metatraderAccountApi.createAccount(accountData);
+      try {
+        account = await metaApi.metatraderAccountApi.createAccount(accountData);
+        console.log(`MetaAPI account created with ID: ${account.id}`);
+      } catch (createError) {
+        throw new Error(`Failed to create MetaAPI account: ${createError.message}. Please verify MT5 server name is correct.`);
+      }
       
       // Store MetaAPI account ID
       await supabase
@@ -321,39 +328,76 @@ async function syncMT5Metrics(mt5LoginId) {
         .update({ metaapi_account_id: account.id })
         .eq('id', mt5LoginId);
 
-      // Wait for account to deploy
-      await account.deploy();
-      await account.waitDeployed();
+      // Wait for account to deploy (with timeout)
+      console.log(`Deploying MetaAPI account ${account.id}...`);
+      try {
+        await account.deploy();
+        await account.waitDeployed({ timeoutInSeconds: 300 }); // 5 minute timeout
+        console.log(`MetaAPI account ${account.id} deployed successfully`);
+      } catch (deployError) {
+        throw new Error(`Account deployment failed: ${deployError.message}. This may be due to invalid credentials or broker server issues.`);
+      }
+    } else {
+      console.log(`Using existing MetaAPI account ${account.id} for MT5 login ${mt5Login.login}`);
+      
+      // Ensure account is deployed
+      if (account.state !== 'DEPLOYED') {
+        console.log(`Deploying existing MetaAPI account ${account.id}...`);
+        await account.deploy();
+        await account.waitDeployed({ timeoutInSeconds: 300 });
+      }
     }
 
-    // Wait for connection
+    // Wait for connection with extended timeout
     const connection = account.getStreamingConnection();
     await connection.connect();
-    await connection.waitSynchronized();
+    
+    // Wait for synchronization with timeout (5 minutes)
+    try {
+      await connection.waitSynchronized({ 
+        timeoutInSeconds: 300,
+        applicationPattern: 'MetaApi'
+      });
+    } catch (syncError) {
+      throw new Error(`Synchronization timeout: ${syncError.message}. The MT5 account may not be connected to the broker or credentials may be invalid.`);
+    }
 
     // Get account information
     accountInfo = connection.accountInformation;
-    const positions = connection.positions;
-    const orders = connection.orders;
+    
+    // Check if account information is available
+    if (!accountInfo || typeof accountInfo !== 'object') {
+      await connection.close();
+      throw new Error('Account information not available after synchronization. Please verify MT5 account credentials and ensure the account is connected to the broker.');
+    }
 
-    // Format metrics
+    // Check if balance exists (basic validation)
+    if (accountInfo.balance === undefined && accountInfo.equity === undefined) {
+      await connection.close();
+      throw new Error('Account information incomplete. The account may be using incorrect credentials or the broker server is not responding.');
+    }
+
+    const positions = connection.positions || [];
+    const orders = connection.orders || [];
+
+    // Format metrics with safe access
     const metrics = {
-      balance: accountInfo.balance || 0,
-      equity: accountInfo.equity || 0,
-      margin: accountInfo.margin || 0,
-      freeMargin: accountInfo.freeMargin || 0,
-      marginLevel: accountInfo.marginLevel || 0,
-      profit: accountInfo.profit || 0,
-      credit: accountInfo.credit || 0,
-      leverage: accountInfo.leverage || 0,
+      balance: accountInfo.balance ?? 0,
+      equity: accountInfo.equity ?? 0,
+      margin: accountInfo.margin ?? 0,
+      freeMargin: accountInfo.freeMargin ?? 0,
+      marginLevel: accountInfo.marginLevel ?? 0,
+      profit: accountInfo.profit ?? 0,
+      credit: accountInfo.credit ?? 0,
+      leverage: accountInfo.leverage ?? 0,
       currency: accountInfo.currency || 'USD',
       type: accountInfo.type || 'hedging',
       name: accountInfo.name || '',
       server: accountInfo.server || mt5Login.server,
-      positions: positions?.length || 0,
-      orders: orders?.length || 0,
+      positions: positions.length,
+      orders: orders.length,
       accountInfo: {
-        name: accountInfo.name,
+        name: accountInfo.name || '',
         login: mt5Login.login,
         server: mt5Login.server,
         platform: 'mt5'
@@ -362,7 +406,12 @@ async function syncMT5Metrics(mt5LoginId) {
     };
 
     // Close connection
-    await connection.close();
+    try {
+      await connection.close();
+    } catch (closeError) {
+      console.warn('Warning: Failed to close connection:', closeError.message);
+      // Don't throw, we already have the data
+    }
 
     // Update database with metrics
     const { error: updateError } = await supabase
@@ -382,9 +431,22 @@ async function syncMT5Metrics(mt5LoginId) {
     return { success: true, metrics };
 
   } catch (error) {
-    console.error('Error syncing MT5 metrics:', error);
+    console.error(`Error syncing MT5 metrics for login ${mt5LoginId}:`, error);
 
-    // Update status to failed
+    // Determine user-friendly error message
+    let errorMessage = error.message;
+    
+    if (error.message?.includes('timeout') || error.message?.includes('Timeout')) {
+      errorMessage = 'Connection timeout. Account may not be connected to broker.';
+    } else if (error.message?.includes('credentials') || error.message?.includes('authentication')) {
+      errorMessage = 'Invalid MT5 credentials. Please verify login, password, and server.';
+    } else if (error.message?.includes('not found')) {
+      errorMessage = 'MT5 account not found in database.';
+    } else if (error.message?.includes('region')) {
+      errorMessage = 'Account region mismatch. Contact support.';
+    }
+
+    // Update status to failed with error message
     await supabase
       .from('mt5_logins')
       .update({ 
@@ -393,7 +455,13 @@ async function syncMT5Metrics(mt5LoginId) {
       })
       .eq('id', mt5LoginId);
 
-    throw error;
+    // Log detailed error for debugging
+    console.error(`[MetaAPI Sync Failed] Login ID: ${mt5LoginId}, Error: ${errorMessage}, Details:`, {
+      originalError: error.message,
+      stack: error.stack?.split('\n')[0]
+    });
+
+    throw new Error(errorMessage);
   }
 }
 
