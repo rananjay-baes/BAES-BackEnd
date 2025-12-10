@@ -764,7 +764,7 @@ app.post('/api/validate-mt5-credentials', async (req, res) => {
       }
 
       if (!metaApiAccount) {
-        // Create new MetaAPI account
+        // Create new MetaAPI account - this validates the credentials
         metaApiAccount = await metaApi.metatraderAccountApi.createAccount({
           name: `MT5-${mt5Login}-${Date.now()}`,
           type: 'cloud',
@@ -775,45 +775,11 @@ app.post('/api/validate-mt5-credentials', async (req, res) => {
           magic: 0
         });
         metaApiAccountId = metaApiAccount.id;
-        console.log(`Created MetaAPI account ${metaApiAccountId}`);
+        console.log(`✓ Created MetaAPI account ${metaApiAccountId} - credentials validated`);
       }
 
-      // Deploy and validate connection
-      await metaApiAccount.deploy();
-      await metaApiAccount.waitDeployed({ timeoutInSeconds: 300 });
-      console.log(`MetaAPI account ${metaApiAccountId} deployed`);
-
-      // Enable MetaStats API
-      try {
-        const axios = (await import('axios')).default;
-        await axios.post(
-          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccountId}/enable-metastats-api`,
-          {},
-          { headers: { 'auth-token': METAAPI_TOKEN } }
-        );
-      } catch (enableError) {
-        console.warn(`MetaStats enable warning: ${enableError.message}`);
-      }
-
-      // Wait for connection (up to 60 seconds)
-      const axios = (await import('axios')).default;
-      let connected = false;
-      let attempts = 0;
-      
-      while (!connected && attempts < 6) {
-        await new Promise(resolve => setTimeout(resolve, 10000));
-        const stateResponse = await axios.get(
-          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccountId}`,
-          { headers: { 'auth-token': METAAPI_TOKEN } }
-        );
-        connected = stateResponse.data.connectionStatus === 'CONNECTED';
-        attempts++;
-        console.log(`Connection check ${attempts}/6: ${stateResponse.data.connectionStatus}`);
-      }
-
-      if (!connected) {
-        throw new Error('Failed to connect to broker. Please verify your MT5 credentials are correct.');
-      }
+      // Note: We don't deploy or connect here to keep validation fast
+      // Deployment and connection will happen during metrics sync when needed
 
       // Encrypt password for storage
       const encryptedPassword = encryptMT5Password(mt5Password);
