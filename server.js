@@ -704,6 +704,193 @@ app.post('/api/admin/change-password', authenticateToken, async (req, res) => {
   }
 });
 
+// Validate MT5 credentials endpoint (before signup)
+app.post('/api/validate-mt5-credentials', async (req, res) => {
+  try {
+    const { email, mt5Login, mt5Password, mt5Server } = req.body;
+
+    // Validation
+    if (!email || !mt5Login || !mt5Password || !mt5Server) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email, MT5 login, password, and server are required'
+      });
+    }
+
+    if (!metaApi) {
+      return res.status(503).json({
+        success: false,
+        error: 'MT5 validation service not available. Please contact support.'
+      });
+    }
+
+    // Check if this MT5 account is already validated for this email (and not expired)
+    const { data: existingValidation } = await supabase
+      .from('mt5_validations')
+      .select('id, is_validated, expires_at, metaapi_account_id')
+      .eq('email', email.toLowerCase())
+      .eq('login', mt5Login)
+      .eq('server', mt5Server)
+      .gt('expires_at', new Date().toISOString())
+      .single();
+
+    if (existingValidation && existingValidation.is_validated) {
+      return res.json({
+        success: true,
+        message: 'MT5 account already validated',
+        data: {
+          validationId: existingValidation.id,
+          isValidated: true,
+          expiresAt: existingValidation.expires_at
+        }
+      });
+    }
+
+    // Create or update MetaAPI account
+    console.log(`Validating MT5 credentials for ${mt5Login} on ${mt5Server}...`);
+    
+    let metaApiAccountId = existingValidation?.metaapi_account_id;
+    let metaApiAccount;
+
+    try {
+      if (metaApiAccountId) {
+        // Try to get existing account
+        try {
+          metaApiAccount = await metaApi.metatraderAccountApi.getAccount(metaApiAccountId);
+          console.log(`Using existing MetaAPI account ${metaApiAccountId}`);
+        } catch {
+          metaApiAccountId = null;
+        }
+      }
+
+      if (!metaApiAccount) {
+        // Create new MetaAPI account
+        metaApiAccount = await metaApi.metatraderAccountApi.createAccount({
+          name: `MT5-${mt5Login}-${Date.now()}`,
+          type: 'cloud',
+          login: mt5Login,
+          password: mt5Password,
+          server: mt5Server,
+          platform: 'mt5',
+          magic: 0
+        });
+        metaApiAccountId = metaApiAccount.id;
+        console.log(`Created MetaAPI account ${metaApiAccountId}`);
+      }
+
+      // Deploy and validate connection
+      await metaApiAccount.deploy();
+      await metaApiAccount.waitDeployed({ timeoutInSeconds: 300 });
+      console.log(`MetaAPI account ${metaApiAccountId} deployed`);
+
+      // Enable MetaStats API
+      try {
+        const axios = (await import('axios')).default;
+        await axios.post(
+          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccountId}/enable-metastats-api`,
+          {},
+          { headers: { 'auth-token': METAAPI_TOKEN } }
+        );
+      } catch (enableError) {
+        console.warn(`MetaStats enable warning: ${enableError.message}`);
+      }
+
+      // Wait for connection (up to 60 seconds)
+      const axios = (await import('axios')).default;
+      let connected = false;
+      let attempts = 0;
+      
+      while (!connected && attempts < 6) {
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        const stateResponse = await axios.get(
+          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccountId}`,
+          { headers: { 'auth-token': METAAPI_TOKEN } }
+        );
+        connected = stateResponse.data.connectionStatus === 'CONNECTED';
+        attempts++;
+        console.log(`Connection check ${attempts}/6: ${stateResponse.data.connectionStatus}`);
+      }
+
+      if (!connected) {
+        throw new Error('Failed to connect to broker. Please verify your MT5 credentials are correct.');
+      }
+
+      // Encrypt password for storage
+      const encryptedPassword = encryptMT5Password(mt5Password);
+
+      // Store validation
+      const validationData = {
+        email: email.toLowerCase(),
+        login: mt5Login,
+        password: encryptedPassword,
+        server: mt5Server,
+        metaapi_account_id: metaApiAccountId,
+        is_validated: true,
+        validation_attempted_at: new Date().toISOString(),
+        validated_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(), // 3 days
+        updated_at: new Date().toISOString()
+      };
+
+      const { data: validation, error: validationError } = await supabase
+        .from('mt5_validations')
+        .upsert(validationData, { onConflict: 'email,login,server' })
+        .select()
+        .single();
+
+      if (validationError) {
+        throw new Error(`Failed to store validation: ${validationError.message}`);
+      }
+
+      console.log(`✓ MT5 account ${mt5Login} validated successfully`);
+
+      res.json({
+        success: true,
+        message: 'MT5 credentials validated successfully',
+        data: {
+          validationId: validation.id,
+          isValidated: true,
+          expiresAt: validation.expires_at
+        }
+      });
+
+    } catch (error) {
+      console.error('MT5 validation error:', error);
+
+      // Store failed validation attempt
+      try {
+        await supabase
+          .from('mt5_validations')
+          .upsert({
+            email: email.toLowerCase(),
+            login: mt5Login,
+            password: encryptMT5Password(mt5Password),
+            server: mt5Server,
+            is_validated: false,
+            validation_attempted_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'email,login,server' });
+      } catch (storeError) {
+        console.error('Failed to store validation attempt:', storeError);
+      }
+
+      res.status(400).json({
+        success: false,
+        error: error.message || 'Failed to validate MT5 credentials. Please verify login, password, and server are correct.'
+      });
+    }
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
 // Signup endpoint
 app.post('/api/signup', async (req, res) => {
   try {
@@ -861,121 +1048,41 @@ app.post('/api/signup', async (req, res) => {
       }
     }
 
-    // VALIDATE MT5 CREDENTIALS by creating and deploying MetaAPI accounts
-    console.log(`Validating ${mt5Accounts.length} MT5 account(s)...`);
-    const metaApiAccounts = [];
+    // CHECK FOR PRE-VALIDATED MT5 CREDENTIALS
+    console.log(`Checking for pre-validated MT5 accounts for ${email}...`);
+    const validatedAccounts = [];
     
-    if (metaApi) {
-      for (let i = 0; i < mt5Accounts.length; i++) {
-        const account = mt5Accounts[i];
-        console.log(`Creating MetaAPI account for MT5 login ${account.mt5Login}...`);
-        
-        try {
-          // Create MetaAPI account
-          const metaApiAccount = await metaApi.metatraderAccountApi.createAccount({
-            name: `MT5-${account.mt5Login}`,
-            type: 'cloud',
-            login: account.mt5Login,
-            password: account.mt5Password, // Plain password for validation
-            server: account.mt5Server,
-            platform: 'mt5',
-            magic: 0
-          });
-          
-          console.log(`MetaAPI account created: ${metaApiAccount.id}`);
-          
-          // Deploy the account
-          console.log(`Deploying MetaAPI account ${metaApiAccount.id}...`);
-          await metaApiAccount.deploy();
-          await metaApiAccount.waitDeployed({ timeoutInSeconds: 300 });
-          console.log(`Account ${metaApiAccount.id} deployed successfully`);
-          
-          // Enable MetaStats API
-          try {
-            const axios = (await import('axios')).default;
-            await axios.post(
-              `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccount.id}/enable-metastats-api`,
-              {},
-              {
-                headers: {
-                  'auth-token': METAAPI_TOKEN
-                }
-              }
-            );
-            console.log(`MetaStats enabled for account ${metaApiAccount.id}`);
-          } catch (enableError) {
-            console.warn(`MetaStats enable warning: ${enableError.message}`);
-          }
-          
-          // Verify connection by checking state
-          try {
-            const axios = (await import('axios')).default;
-            const stateResponse = await axios.get(
-              `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccount.id}`,
-              {
-                headers: {
-                  'auth-token': METAAPI_TOKEN
-                }
-              }
-            );
-            const accountState = stateResponse.data;
-            console.log(`Account ${metaApiAccount.id} state: ${accountState.state}, connection: ${accountState.connectionStatus}`);
-            
-            // Wait for connection (up to 60 seconds)
-            let connected = accountState.connectionStatus === 'CONNECTED';
-            let attempts = 0;
-            while (!connected && attempts < 6) {
-              await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds
-              const checkResponse = await axios.get(
-                `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${metaApiAccount.id}`,
-                {
-                  headers: {
-                    'auth-token': METAAPI_TOKEN
-                  }
-                }
-              );
-              connected = checkResponse.data.connectionStatus === 'CONNECTED';
-              attempts++;
-              console.log(`Connection attempt ${attempts}/6: ${checkResponse.data.connectionStatus}`);
-            }
-            
-            if (!connected) {
-              throw new Error(`MT5 account ${account.mt5Login} failed to connect to broker. Please verify credentials (login, password, server) are correct.`);
-            }
-          } catch (stateError) {
-            throw new Error(`Failed to verify MT5 account ${account.mt5Login}: ${stateError.message}`);
-          }
-          
-          metaApiAccounts.push({
-            index: i,
-            accountId: metaApiAccount.id
-          });
-          
-        } catch (createError) {
-          console.error(`Failed to create/deploy MT5 account ${account.mt5Login}:`, createError);
-          
-          // Clean up any created accounts
-          for (const created of metaApiAccounts) {
-            try {
-              const acc = await metaApi.metatraderAccountApi.getAccount(created.accountId);
-              await acc.remove();
-              console.log(`Cleaned up account ${created.accountId}`);
-            } catch (cleanupError) {
-              console.warn(`Failed to cleanup account ${created.accountId}`);
-            }
-          }
-          
-          return res.status(400).json({
-            success: false,
-            error: `Invalid MT5 credentials for login ${account.mt5Login}: ${createError.message}. Please verify your MT5 login, password, and server are correct.`
-          });
-        }
-      }
+    for (let i = 0; i < mt5Accounts.length; i++) {
+      const account = mt5Accounts[i];
       
-      console.log(`✓ All ${mt5Accounts.length} MT5 account(s) validated successfully`);
-    } else {
-      console.warn('⚠️  MetaAPI not initialized - skipping credential validation');
+      // Check if this MT5 account was pre-validated
+      const { data: validation, error: validationError } = await supabase
+        .from('mt5_validations')
+        .select('id, login, server, metaapi_account_id, is_validated, expires_at, password')
+        .eq('email', email.toLowerCase())
+        .eq('login', account.mt5Login)
+        .eq('server', account.mt5Server)
+        .eq('is_validated', true)
+        .eq('is_used', false)
+        .gt('expires_at', new Date().toISOString())
+        .single();
+
+      if (validationError || !validation) {
+        return res.status(400).json({
+          success: false,
+          error: `MT5 account ${account.mt5Login} on ${account.mt5Server} is not validated. Please click 'Validate' button for this account before submitting.`
+        });
+      }
+
+      validatedAccounts.push({
+        index: i,
+        validationId: validation.id,
+        metaApiAccountId: validation.metaapi_account_id,
+        encryptedPassword: validation.password
+      });
     }
+    
+    console.log(`✓ All ${mt5Accounts.length} MT5 account(s) are pre-validated`);
 
     // Insert user data into Supabase (without MT5 fields)
     const { data: userData, error: userError } = await supabase
@@ -1007,28 +1114,22 @@ app.post('/api/signup', async (req, res) => {
       });
     }
 
-    // Insert all MT5 login accounts with MetaAPI account IDs
-    const mt5InsertPromises = mt5Accounts.map(async (account, index) => {
-      // Encrypt the MT5 password (not hash, so MetaAPI can decrypt and use it)
-      const encryptedMT5Password = encryptMT5Password(account.mt5Password);
-      
-      // Find the corresponding MetaAPI account ID
-      const metaApiAccount = metaApiAccounts.find(acc => acc.index === index);
+    // Insert all MT5 login accounts using pre-validated data
+    const mt5DataToInsert = mt5Accounts.map((account, index) => {
+      // Find the corresponding validated account
+      const validated = validatedAccounts.find(acc => acc.index === index);
 
       return {
         user_id: userData.id,
         login: account.mt5Login,
-        password: encryptedMT5Password, // Password is encrypted (not hashed) for MetaAPI
+        password: validated.encryptedPassword, // Use already encrypted password from validation
         server: account.mt5Server,
         is_active: true,
         is_primary: index === 0, // First MT5 login is primary
-        metaapi_account_id: metaApiAccount ? metaApiAccount.accountId : null,
+        metaapi_account_id: validated.metaApiAccountId,
         created_at: new Date().toISOString()
       };
     });
-
-    // Wait for all password encryption to complete
-    const mt5DataToInsert = await Promise.all(mt5InsertPromises);
 
     // Insert all MT5 logins at once
     const { data: mt5Data, error: mt5Error } = await supabase
@@ -1046,6 +1147,18 @@ app.post('/api/signup', async (req, res) => {
         error: 'Failed to create MT5 logins',
         details: mt5Error.message
       });
+    }
+
+    // Mark MT5 validations as used
+    for (const validated of validatedAccounts) {
+      await supabase
+        .from('mt5_validations')
+        .update({ 
+          is_used: true, 
+          used_at: new Date().toISOString(),
+          user_id: userData.id
+        })
+        .eq('id', validated.validationId);
     }
 
     // Mark invitation as used
@@ -3383,6 +3496,88 @@ app.post('/api/invites/:token/use', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Internal server error',
+    });
+  }
+});
+
+// Cleanup expired MT5 validations (can be called by cron job)
+app.post('/api/cleanup-expired-validations', async (req, res) => {
+  try {
+    console.log('Starting cleanup of expired MT5 validations...');
+
+    // Find expired validations that were not used
+    const { data: expiredValidations, error: fetchError } = await supabase
+      .from('mt5_validations')
+      .select('id, email, login, server, metaapi_account_id')
+      .lt('expires_at', new Date().toISOString())
+      .eq('is_used', false);
+
+    if (fetchError) {
+      throw new Error(`Failed to fetch expired validations: ${fetchError.message}`);
+    }
+
+    console.log(`Found ${expiredValidations.length} expired validation(s)`);
+
+    const cleanupResults = {
+      total: expiredValidations.length,
+      metaApiDeleted: 0,
+      dbDeleted: 0,
+      errors: []
+    };
+
+    // Delete MetaAPI accounts and database records
+    for (const validation of expiredValidations) {
+      try {
+        // Delete from MetaAPI if account exists
+        if (validation.metaapi_account_id && metaApi) {
+          try {
+            const metaApiAccount = await metaApi.metatraderAccountApi.getAccount(validation.metaapi_account_id);
+            await metaApiAccount.remove();
+            console.log(`✓ Deleted MetaAPI account ${validation.metaapi_account_id} for ${validation.login}`);
+            cleanupResults.metaApiDeleted++;
+          } catch (metaApiError) {
+            console.warn(`MetaAPI cleanup warning for ${validation.metaapi_account_id}: ${metaApiError.message}`);
+          }
+        }
+
+        // Delete from database
+        const { error: deleteError } = await supabase
+          .from('mt5_validations')
+          .delete()
+          .eq('id', validation.id);
+
+        if (deleteError) {
+          throw new Error(`Failed to delete validation ${validation.id}: ${deleteError.message}`);
+        }
+
+        console.log(`✓ Deleted database record for ${validation.email}/${validation.login}`);
+        cleanupResults.dbDeleted++;
+
+      } catch (error) {
+        console.error(`Error cleaning up validation ${validation.id}:`, error);
+        cleanupResults.errors.push({
+          id: validation.id,
+          email: validation.email,
+          login: validation.login,
+          error: error.message
+        });
+      }
+    }
+
+    console.log('Cleanup completed:', cleanupResults);
+
+    res.json({
+      success: true,
+      message: 'Cleanup completed',
+      results: cleanupResults
+    });
+
+  } catch (error) {
+    console.error('Cleanup error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Cleanup failed',
+      details: error.message
     });
   }
 });
