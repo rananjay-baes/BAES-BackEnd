@@ -282,70 +282,79 @@ async function syncMT5Metrics(mt5LoginId) {
       throw new Error('MetaAPI account not found. Account should have been created during signup.');
     }
 
-    // Update status to syncing
-    await supabase
-      .from('mt5_logins')
-      .update({ sync_status: 'syncing' })
-      .eq('id', mt5LoginId);
+    // Import axios for HTTP requests
+    const axios = (await import('axios')).default;
 
     // Get the MetaAPI account
     const account = await metaApi.metatraderAccountApi.getAccount(mt5Login.metaapi_account_id);
     console.log(`Using MetaAPI account ${account.id} for MT5 login ${mt5Login.login}`);
 
-    // Use MetaAPI HTTP endpoints to fetch metrics
-    console.log(`Fetching metrics for account ${account.id} via MetaStats API...`);
-    
-    // Import axios for HTTP requests
-    const axios = (await import('axios')).default;
-    
-    // Step 1: Check account state and get region (with retry for deploying accounts)
-    let accountState;
-    const maxRetries = 10;
-    const retryDelayMs = 10000; // 10 seconds
-    
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // Step 1: Check current account state
+    const stateResponse = await axios.get(
+      `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}`,
+      { headers: { 'auth-token': METAAPI_TOKEN } }
+    );
+    let accountState = stateResponse.data;
+    console.log(`Account state: ${accountState.state}, Connection: ${accountState.connectionStatus}, Region: ${accountState.region}`);
+
+    // Step 2: Deploy if not deployed
+    if (accountState.state !== 'DEPLOYED' && accountState.state !== 'DEPLOYING') {
+      console.log(`Deploying account ${account.id}...`);
+      await supabase
+        .from('mt5_logins')
+        .update({ sync_status: 'deploying' })
+        .eq('id', mt5LoginId);
+      
+      await account.deploy();
+      console.log(`Account ${account.id} deployment initiated`);
+      
+      // Wait for deployment to start
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      
+      // Refresh state
+      const newStateResponse = await axios.get(
+        `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}`,
+        { headers: { 'auth-token': METAAPI_TOKEN } }
+      );
+      accountState = newStateResponse.data;
+    }
+
+    // Step 3: Enable MetaStats API (if not enabled)
+    if (!accountState.metastatsApiEnabled) {
+      console.log(`Enabling MetaStats API for account ${account.id}...`);
       try {
-        const stateResponse = await axios.get(
-          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}`,
-          {
-            headers: {
-              'auth-token': METAAPI_TOKEN
-            }
-          }
+        await axios.post(
+          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}/enable-metastats-api`,
+          {},
+          { headers: { 'auth-token': METAAPI_TOKEN } }
         );
-        accountState = stateResponse.data;
-        console.log(`[Attempt ${attempt}/${maxRetries}] Account state: ${accountState.state}, Connection status: ${accountState.connectionStatus}, Region: ${accountState.region}`);
-        
-        // Check if account is ready (deployed and connected)
-        if (accountState.state === 'DEPLOYED' && accountState.connectionStatus === 'CONNECTED') {
-          console.log(`Account ${account.id} is ready (deployed and connected)`);
-          break;
-        }
-        
-        // If still deploying or disconnected, wait and retry
-        if (attempt < maxRetries) {
-          console.log(`Account not ready yet. Waiting ${retryDelayMs/1000} seconds before retry...`);
-          await new Promise(resolve => setTimeout(resolve, retryDelayMs));
-        } else {
-          // Last attempt failed
-          throw new Error(`MT5 account not ready after ${maxRetries} attempts. State: ${accountState.state}, Connection: ${accountState.connectionStatus}. Please verify credentials.`);
-        }
-      } catch (stateError) {
-        if (attempt === maxRetries) {
-          throw new Error(`Failed to fetch account state: ${stateError.response?.data?.message || stateError.message}`);
-        }
-        console.log(`Error checking state, retrying in ${retryDelayMs/1000} seconds...`);
-        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        console.log(`✓ MetaStats API enabled for account ${account.id}`);
+      } catch (enableError) {
+        console.warn(`MetaStats enable warning: ${enableError.response?.data?.message || enableError.message}`);
       }
     }
 
-    // Final validation
-    if (!accountState || accountState.connectionStatus !== 'CONNECTED') {
-      throw new Error(`MT5 account is not connected to broker. Current status: ${accountState?.connectionStatus || 'UNKNOWN'}. Please verify credentials and ensure the account is accessible.`);
+    // Step 4: Check if still deploying
+    if (accountState.state === 'DEPLOYING' || accountState.connectionStatus !== 'CONNECTED') {
+      await supabase
+        .from('mt5_logins')
+        .update({ 
+          sync_status: 'deploying',
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', mt5LoginId);
+      
+      throw new Error(`Account is still being deployed and connecting to broker. State: ${accountState.state}, Connection: ${accountState.connectionStatus}. Please wait a few minutes and try again.`);
     }
 
-    // Get region for MetaStats API
-    const region = accountState.region || 'london';
+    // Step 5: Update status to syncing
+    await supabase
+      .from('mt5_logins')
+      .update({ sync_status: 'syncing' })
+      .eq('id', mt5LoginId);
+
+    // Step 6: Get region for MetaStats API
+    const region = accountState.region || 'new-york';
     const metricsUrl = `https://metastats-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${account.id}/metrics`;
     console.log(`Fetching metrics from: ${metricsUrl}`);
 
@@ -430,24 +439,29 @@ async function syncMT5Metrics(mt5LoginId) {
   } catch (error) {
     console.error(`Error syncing MT5 metrics for login ${mt5LoginId}:`, error);
 
-    // Determine user-friendly error message
+    // Determine user-friendly error message and sync status
     let errorMessage = error.message;
+    let syncStatus = 'failed';
     
-    if (error.message?.includes('timeout') || error.message?.includes('Timeout')) {
+    if (error.message?.includes('still being deployed') || error.message?.includes('DEPLOYING')) {
+      syncStatus = 'deploying';
+      errorMessage = 'Account is being deployed and connecting to broker. This may take a few minutes.';
+    } else if (error.message?.includes('timeout') || error.message?.includes('Timeout')) {
       errorMessage = 'Connection timeout. Account may not be connected to broker.';
     } else if (error.message?.includes('credentials') || error.message?.includes('authentication')) {
       errorMessage = 'Invalid MT5 credentials. Please verify login, password, and server.';
     } else if (error.message?.includes('not found')) {
       errorMessage = 'MT5 account not found in database.';
-    } else if (error.message?.includes('region')) {
-      errorMessage = 'Account region mismatch. Contact support.';
+    } else if (error.message?.includes('not connected to broker yet')) {
+      syncStatus = 'deploying';
+      errorMessage = 'Account is deploying. Please wait a few minutes.';
     }
 
-    // Update status to failed with error message
+    // Update status with error message
     await supabase
       .from('mt5_logins')
       .update({ 
-        sync_status: 'failed',
+        sync_status: syncStatus,
         updated_at: new Date().toISOString()
       })
       .eq('id', mt5LoginId);
@@ -3566,6 +3580,60 @@ app.get('/api/admin/invites', async (req, res) => {
         limit: limitNum,
         total: count || 0,
         totalPages: Math.ceil((count || 0) / limitNum)
+      }
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// Get admin audit logs
+app.get('/api/admin/audit-logs', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { page = 1, limit = 50, adminEmail, action, resourceType } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+
+    let query = supabase
+      .from('admin_audit_logs')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + parseInt(limit) - 1);
+
+    if (adminEmail) {
+      query = query.eq('admin_email', adminEmail);
+    }
+
+    if (action) {
+      query = query.eq('action', action);
+    }
+
+    if (resourceType) {
+      query = query.eq('resource_type', resourceType);
+    }
+
+    const { data, error, count } = await query;
+
+    if (error) {
+      console.error('Error fetching audit logs:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to fetch audit logs'
+      });
+    }
+
+    res.json({
+      success: true,
+      data,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count,
+        totalPages: Math.ceil(count / parseInt(limit))
       }
     });
 
