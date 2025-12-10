@@ -1019,7 +1019,7 @@ app.post('/api/signup', async (req, res) => {
     // Fetch partner details for validation and later notification
     const { data: partner, error: partnerError } = await supabase
       .from('partners')
-      .select('id, full_name, email, status')
+      .select('id, name, email, status')
       .eq('id', invitation.partner_id)
       .single();
 
@@ -1183,7 +1183,7 @@ app.post('/api/signup', async (req, res) => {
     }
 
     // Send notification email to partner about new user onboarding
-    sendPartnerUserOnboardedEmail(partner.email, partner.full_name, fullName, email)
+    sendPartnerUserOnboardedEmail(partner.email, partner.name, fullName, email)
       .then((result) => {
         if (result.success) {
           console.log(`✓ Partner notification sent to ${partner.email}`);
@@ -3327,14 +3327,16 @@ app.post('/api/admin/invites', async (req, res) => {
     // Validate partner exists
     const { data: partner, error: partnerError } = await supabase
       .from('partners')
-      .select('id, full_name, email')
+      .select('id, name, email')
       .eq('id', partnerId)
       .single();
 
     if (partnerError || !partner) {
+      console.error('Partner validation error:', partnerError);
       return res.status(404).json({
         success: false,
-        error: 'Selected partner not found'
+        error: 'Selected partner not found',
+        details: partnerError?.message
       });
     }
 
