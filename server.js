@@ -927,7 +927,7 @@ app.post('/api/signup', async (req, res) => {
     // Check if invitation exists and is valid
     const { data: invitation, error: inviteError } = await supabase
       .from('invites')
-      .select('id, email, token, status, investment_amount, profit_sharing')
+      .select('id, email, token, status, investment_amount, profit_sharing, partner_id')
       .eq('token', inviteToken)
       .single();
 
@@ -1008,27 +1008,33 @@ app.post('/api/signup', async (req, res) => {
       });
     }
 
-    // Validate partner if provided
-    if (partnerId) {
-      const { data: partner, error: partnerError } = await supabase
-        .from('partners')
-        .select('id, status')
-        .eq('id', partnerId)
-        .single();
+    // Get partner from invitation (required)
+    if (!invitation.partner_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'This invitation does not have an associated partner. Please contact support.'
+      });
+    }
 
-      if (partnerError || !partner) {
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid partner ID'
-        });
-      }
+    // Fetch partner details for validation and later notification
+    const { data: partner, error: partnerError } = await supabase
+      .from('partners')
+      .select('id, full_name, email, status')
+      .eq('id', invitation.partner_id)
+      .single();
 
-      if (partner.status !== 'active') {
-        return res.status(400).json({
-          success: false,
-          error: 'Partner is not active'
-        });
-      }
+    if (partnerError || !partner) {
+      return res.status(400).json({
+        success: false,
+        error: 'Partner associated with this invitation not found. Please contact support.'
+      });
+    }
+
+    if (partner.status !== 'active') {
+      return res.status(400).json({
+        success: false,
+        error: 'Partner associated with this invitation is not active. Please contact support.'
+      });
     }
 
     // Check if any MT5 login already exists for this server
@@ -1095,7 +1101,7 @@ app.post('/api/signup', async (req, res) => {
           investment_amount: parseFloat(investmentAmount),
           profit_sharing: profitSharing ? parseFloat(profitSharing) : null,
           country: country,
-          partner_id: partnerId || null,
+          partner_id: partner.id, // Use partner from invitation
           email_verified: emailVerified,
           phone_verified: phoneVerified,
           status: 'pending',
@@ -1175,6 +1181,19 @@ app.post('/api/signup', async (req, res) => {
       console.error('Error updating invitation status:', inviteUpdateError);
       // Don't fail signup if invitation update fails, just log it
     }
+
+    // Send notification email to partner about new user onboarding
+    sendPartnerUserOnboardedEmail(partner.email, partner.full_name, fullName, email)
+      .then((result) => {
+        if (result.success) {
+          console.log(`✓ Partner notification sent to ${partner.email}`);
+        } else {
+          console.warn(`✗ Failed to send partner notification: ${result.error}`);
+        }
+      })
+      .catch((error) => {
+        console.error(`✗ Error sending partner notification:`, error);
+      });
 
     // Trigger metrics sync for all MT5 accounts in background (don't wait for it)
     if (metaApi && mt5Data) {
@@ -1671,6 +1690,191 @@ app.post('/api/login', async (req, res) => {
 // PARTNER MANAGEMENT ENDPOINTS
 // ============================================
 
+// ============================================
+// EMAIL HELPER FUNCTIONS
+// ============================================
+
+/**
+ * Send welcome email to new partner
+ */
+async function sendPartnerWelcomeEmail(partnerEmail, partnerName) {
+  if (!sendGridApiKey) {
+    console.warn('SendGrid not configured. Partner welcome email not sent.');
+    return { success: false, error: 'Email service not configured' };
+  }
+
+  try {
+    const emailBody = `
+      <html>
+        <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f5f5f5;">
+          <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <h2 style="color: #333; margin-bottom: 20px;">Welcome to BAES Solutions Partner Program!</h2>
+            <p style="color: #666; font-size: 16px; line-height: 1.6;">
+              Dear ${partnerName},
+            </p>
+            <p style="color: #666; font-size: 16px; line-height: 1.6;">
+              Congratulations! You have been successfully added as a partner on the BAES Solutions platform.
+            </p>
+            <div style="background-color: #f0f7ff; padding: 20px; border-radius: 6px; margin: 20px 0;">
+              <h3 style="color: #0066cc; margin: 0 0 10px 0;">What's Next?</h3>
+              <ul style="color: #666; margin: 0; padding-left: 20px;">
+                <li>You will receive notifications when users you refer sign up</li>
+                <li>Track your referrals and commissions through the partner dashboard</li>
+                <li>View detailed statistics of your referred users</li>
+              </ul>
+            </div>
+            <p style="color: #666; font-size: 16px; line-height: 1.6;">
+              Thank you for joining our partner program. We look forward to a successful partnership!
+            </p>
+            <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+            <p style="color: #999; font-size: 12px; margin: 0;">BAES Solutions LLC</p>
+            <p style="color: #999; font-size: 12px; margin: 5px 0 0 0;">
+              If you have any questions, please contact our support team.
+            </p>
+          </div>
+        </body>
+      </html>
+    `;
+
+    const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${sendGridApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        personalizations: [{
+          to: [{ email: partnerEmail }]
+        }],
+        from: { 
+          email: sendGridFromEmail,
+          name: 'BAES Solutions'
+        },
+        subject: 'Welcome to BAES Solutions Partner Program',
+        content: [{
+          type: 'text/html',
+          value: emailBody
+        }]
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('SendGrid error sending partner welcome email:', {
+        status: response.status,
+        error: errorText
+      });
+      return { success: false, error: `SendGrid error: ${response.status}` };
+    }
+
+    console.log(`✓ Partner welcome email sent to ${partnerEmail}`);
+    return { success: true };
+
+  } catch (error) {
+    console.error('Error sending partner welcome email:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Send notification to partner when their referred user signs up
+ */
+async function sendPartnerUserOnboardedEmail(partnerEmail, partnerName, userName, userEmail) {
+  if (!sendGridApiKey) {
+    console.warn('SendGrid not configured. Partner onboarding notification not sent.');
+    return { success: false, error: 'Email service not configured' };
+  }
+
+  try {
+    const emailBody = `
+      <html>
+        <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f5f5f5;">
+          <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <h2 style="color: #333; margin-bottom: 20px;">🎉 New User Onboarded!</h2>
+            <p style="color: #666; font-size: 16px; line-height: 1.6;">
+              Dear ${partnerName},
+            </p>
+            <p style="color: #666; font-size: 16px; line-height: 1.6;">
+              Great news! A user you referred has successfully completed their onboarding on the BAES Solutions platform.
+            </p>
+            <div style="background-color: #f0f7ff; padding: 20px; border-radius: 6px; margin: 20px 0;">
+              <h3 style="color: #0066cc; margin: 0 0 15px 0;">User Details</h3>
+              <table style="width: 100%; color: #666;">
+                <tr>
+                  <td style="padding: 8px 0;"><strong>Name:</strong></td>
+                  <td style="padding: 8px 0;">${userName}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0;"><strong>Email:</strong></td>
+                  <td style="padding: 8px 0;">${userEmail}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0;"><strong>Status:</strong></td>
+                  <td style="padding: 8px 0;">
+                    <span style="background-color: #10b981; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px;">
+                      Active
+                    </span>
+                  </td>
+                </tr>
+              </table>
+            </div>
+            <p style="color: #666; font-size: 16px; line-height: 1.6;">
+              You can now track this user's activity and your commissions through the partner dashboard.
+            </p>
+            <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+            <p style="color: #999; font-size: 12px; margin: 0;">BAES Solutions LLC</p>
+            <p style="color: #999; font-size: 12px; margin: 5px 0 0 0;">
+              This is an automated notification. Please do not reply to this email.
+            </p>
+          </div>
+        </body>
+      </html>
+    `;
+
+    const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${sendGridApiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        personalizations: [{
+          to: [{ email: partnerEmail }]
+        }],
+        from: { 
+          email: sendGridFromEmail,
+          name: 'BAES Solutions'
+        },
+        subject: 'New User Onboarded - BAES Solutions',
+        content: [{
+          type: 'text/html',
+          value: emailBody
+        }]
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('SendGrid error sending partner onboarding notification:', {
+        status: response.status,
+        error: errorText
+      });
+      return { success: false, error: `SendGrid error: ${response.status}` };
+    }
+
+    console.log(`✓ Partner onboarding notification sent to ${partnerEmail}`);
+    return { success: true };
+
+  } catch (error) {
+    console.error('Error sending partner onboarding notification:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+// ============================================
+// PARTNER ENDPOINTS
+// ============================================
+
 // Create a new partner
 app.post('/api/partners', async (req, res) => {
   try {
@@ -1722,10 +1926,25 @@ app.post('/api/partners', async (req, res) => {
       });
     }
 
+    // Send welcome email to partner
+    const emailResult = await sendPartnerWelcomeEmail(email, name);
+    
+    // Update welcome_email_sent flag if email was sent
+    if (emailResult.success) {
+      await supabase
+        .from('partners')
+        .update({ 
+          welcome_email_sent: true,
+          welcome_email_sent_at: new Date().toISOString()
+        })
+        .eq('id', data.id);
+    }
+
     res.status(201).json({
       success: true,
       message: 'Partner created successfully',
-      data
+      data,
+      emailSent: emailResult.success
     });
 
   } catch (error) {
@@ -3096,12 +3315,26 @@ function generateInviteToken() {
 // Create invite and send email
 app.post('/api/admin/invites', async (req, res) => {
   try {
-    const { email, investmentAmount, profitSharing } = req.body;
+    const { email, investmentAmount, profitSharing, partnerId } = req.body;
 
-    if (!email || !investmentAmount || profitSharing === undefined) {
+    if (!email || !investmentAmount || profitSharing === undefined || !partnerId) {
       return res.status(400).json({
         success: false,
-        error: 'Email, investment amount, and profit sharing are required'
+        error: 'Email, investment amount, profit sharing, and partner selection are required'
+      });
+    }
+
+    // Validate partner exists
+    const { data: partner, error: partnerError } = await supabase
+      .from('partners')
+      .select('id, full_name, email')
+      .eq('id', partnerId)
+      .single();
+
+    if (partnerError || !partner) {
+      return res.status(404).json({
+        success: false,
+        error: 'Selected partner not found'
       });
     }
 
@@ -3138,6 +3371,7 @@ app.post('/api/admin/invites', async (req, res) => {
           email,
           investment_amount: parseFloat(investmentAmount),
           profit_sharing: profitSharingNum,
+          partner_id: partnerId,
           token,
           status: 'pending',
           expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days
