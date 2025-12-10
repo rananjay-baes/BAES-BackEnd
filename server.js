@@ -998,38 +998,38 @@ app.post('/api/signup', async (req, res) => {
     }
 
     // Fetch partner details for validation and later notification
-    const { data: partner, error: partnerError } = await supabase
-      .from('partners')
+      const { data: partner, error: partnerError } = await supabase
+        .from('partners')
       .select('id, name, email, status')
       .eq('id', invitation.partner_id)
-      .single();
+        .single();
 
-    if (partnerError || !partner) {
-      return res.status(400).json({
-        success: false,
+      if (partnerError || !partner) {
+        return res.status(400).json({
+          success: false,
         error: 'Partner associated with this invitation not found. Please contact support.'
-      });
-    }
+        });
+      }
 
-    if (partner.status !== 'active') {
-      return res.status(400).json({
-        success: false,
+      if (partner.status !== 'active') {
+        return res.status(400).json({
+          success: false,
         error: 'Partner associated with this invitation is not active. Please contact support.'
-      });
+        });
     }
 
     // Check if any MT5 login already exists for this server
     for (const account of mt5Accounts) {
       const { data: existingMT5 } = await supabase
-        .from('mt5_logins')
-        .select('id')
+      .from('mt5_logins')
+      .select('id')
         .eq('login', account.mt5Login)
         .eq('server', account.mt5Server)
-        .single();
+      .single();
 
-      if (existingMT5) {
-        return res.status(409).json({
-          success: false,
+    if (existingMT5) {
+      return res.status(409).json({
+        success: false,
           error: `MT5 login ${account.mt5Login} already exists for server ${account.mt5Server}`
         });
       }
@@ -1058,8 +1058,8 @@ app.post('/api/signup', async (req, res) => {
         return res.status(400).json({
           success: false,
           error: `MT5 account ${account.mt5Login} on ${account.mt5Server} is not validated. Please click 'Validate' button for this account before submitting.`
-        });
-      }
+      });
+    }
 
       validatedAccounts.push({
         index: i,
@@ -1107,14 +1107,14 @@ app.post('/api/signup', async (req, res) => {
       const validated = validatedAccounts.find(acc => acc.index === index);
 
       return {
-        user_id: userData.id,
+          user_id: userData.id,
         login: account.mt5Login,
         password: validated.encryptedPassword, // Use already encrypted password from validation
         server: account.mt5Server,
-        is_active: true,
+          is_active: true,
         is_primary: index === 0, // First MT5 login is primary
         metaapi_account_id: validated.metaApiAccountId,
-        created_at: new Date().toISOString()
+          created_at: new Date().toISOString()
       };
     });
 
@@ -2254,7 +2254,7 @@ app.get('/api/users/:userId/mt5-logins', async (req, res) => {
 
     const { data, error } = await supabase
       .from('mt5_logins')
-      .select('id, login, server, is_active, is_primary, created_at, updated_at')
+      .select('id, login, server, is_active, is_primary, created_at, updated_at, metrics, metrics_last_synced, sync_status')
       .eq('user_id', userId)
       .order('is_primary', { ascending: false })
       .order('created_at', { ascending: false });
@@ -2405,7 +2405,7 @@ app.get('/api/users/:userId', async (req, res) => {
     // Get MT5 logins
     const { data: mt5Logins } = await supabase
       .from('mt5_logins')
-      .select('id, login, server, is_active, is_primary, created_at')
+      .select('id, login, server, is_active, is_primary, created_at, metrics, metrics_last_synced, sync_status')
       .eq('user_id', userId)
       .order('is_primary', { ascending: false });
 
@@ -2834,7 +2834,10 @@ app.get('/api/admin/users/with-mt5', async (req, res) => {
           server,
           is_active,
           is_primary,
-          created_at
+          created_at,
+          metrics,
+          metrics_last_synced,
+          sync_status
         )
       `, { count: 'exact' })
       .order('created_at', { ascending: false })
